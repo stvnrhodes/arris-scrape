@@ -6,33 +6,160 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
-func main() {
-	var page io.Reader = strings.NewReader(htmlSample)
-	_ = page
+type downstreamChannel struct {
+	ChannelID      int
+	LockStatus     string
+	Modulation     string
+	FrequencyHz    int64
+	PowerdBmV      float64
+	SNRMERdB       float64
+	Corrected      int
+	Uncorrectables int
 }
 
-func futureMain() {
-	ctx := context.Background()
-	addr := flag.String("addr", "192.168.100.1", "Modem address")
-	username := flag.String("username", "admin", "Modem username")
-	passwd := flag.String("passwd", os.Getenv("MODEM_PASSWD"), "Modem password")
-	flag.Parse()
+type upstreamChannel struct {
+	Channel     string
+	ChannelID   int
+	LockStatus  string
+	ChannelType string
+	FrequencyHz int64
+	WidthHz     int64
+	PowerdBmV   float64
+}
 
-	baseURL := "https://" + *addr + "/cmconnectionstatus.html"
-	authURL := baseURL + "?login_" + base64.URLEncoding.EncodeToString([]byte(*username+":"+*passwd))
+func findTextNode(node *html.Node, text string) *html.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Type == html.TextNode && node.Data == text {
+		return node
+	}
+	if n := findTextNode(node.FirstChild, text); n != nil {
+		return n
+	}
+	if n := findTextNode(node.NextSibling, text); n != nil {
+		return n
+	}
+	return nil
+}
+
+func scrapeTable(rowPtr *html.Node) [][]string {
+	var scraped [][]string
+	for rowPtr != nil {
+		if len(rowPtr.Attr) == 1 && rowPtr.Attr[0].Key == "align" && rowPtr.Attr[0].Val == "left" {
+			var vals []string
+			columnPtr := rowPtr.FirstChild
+			for columnPtr != nil {
+				if columnPtr.Data == "td" {
+					vals = append(vals, columnPtr.FirstChild.Data)
+				}
+				columnPtr = columnPtr.NextSibling
+			}
+			scraped = append(scraped, vals)
+		}
+		rowPtr = rowPtr.NextSibling
+	}
+	return scraped
+}
+func parseDownstream(page *html.Node) ([]downstreamChannel, error) {
+	var data []downstreamChannel
+	tableTitle := findTextNode(page, "Downstream Bonded Channels")
+	if tableTitle == nil {
+		return nil, fmt.Errorf("unable to find downstream bonded channels table")
+	}
+	for _, row := range scrapeTable(tableTitle.Parent.Parent.Parent) {
+		channelID, err := strconv.Atoi(row[0])
+		if err != nil {
+			return nil, err
+		}
+		frequencyHz, err := strconv.ParseInt(strings.Split(row[3], " ")[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		powerdBmV, err := strconv.ParseFloat(strings.Split(row[4], " ")[0], 64)
+		if err != nil {
+			return nil, err
+		}
+		snrMERdB, err := strconv.ParseFloat(strings.Split(row[5], " ")[0], 64)
+		if err != nil {
+			return nil, err
+		}
+		corrected, err := strconv.Atoi(row[6])
+		if err != nil {
+			return nil, err
+		}
+		uncorrectables, err := strconv.Atoi(row[7])
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, downstreamChannel{
+			ChannelID:      channelID,
+			LockStatus:     row[1],
+			Modulation:     row[2],
+			FrequencyHz:    frequencyHz,
+			PowerdBmV:      powerdBmV,
+			SNRMERdB:       snrMERdB,
+			Corrected:      corrected,
+			Uncorrectables: uncorrectables,
+		})
+	}
+	return data, nil
+}
+func parseUpstream(page *html.Node) ([]upstreamChannel, error) {
+	var data []upstreamChannel
+	tableTitle := findTextNode(page, "Upstream Bonded Channels")
+	if tableTitle == nil {
+		return nil, fmt.Errorf("unable to find upstream bonded channels table")
+	}
+	for _, row := range scrapeTable(tableTitle.Parent.Parent.Parent) {
+		channelID, err := strconv.Atoi(row[1])
+		if err != nil {
+			return nil, err
+		}
+		frequencyHz, err := strconv.ParseInt(strings.Split(row[4], " ")[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		widthHz, err := strconv.ParseInt(strings.Split(row[5], " ")[0], 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		powerdBmV, err := strconv.ParseFloat(strings.Split(row[6], " ")[0], 64)
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, upstreamChannel{
+			Channel:     row[0],
+			ChannelID:   channelID,
+			LockStatus:  row[2],
+			ChannelType: row[3],
+			FrequencyHz: frequencyHz,
+			WidthHz:     widthHz,
+			PowerdBmV:   powerdBmV,
+		})
+	}
+	return data, nil
+}
+
+func fetchPage(ctx context.Context, addr, username, passwd string) (*html.Node, error) {
+	baseURL := "https://" + addr + "/cmconnectionstatus.html"
+	authURL := baseURL + "?login_" + base64.URLEncoding.EncodeToString([]byte(username+":"+passwd))
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	client := &http.Client{
 		Jar: jar,
@@ -50,607 +177,47 @@ func futureMain() {
 	}
 	authReq, err := http.NewRequestWithContext(ctx, "GET", authURL, nil)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	authReq.SetBasicAuth(*username, *passwd)
+	authReq.SetBasicAuth(username, passwd)
 	authResp, err := client.Do(authReq)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	fmt.Println(authResp.Cookies())
 	token, err := ioutil.ReadAll(authResp.Body)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	url := baseURL + "?ct_" + string(token)
-	fmt.Println(url)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	fmt.Println(resp)
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(string(body))
+	return html.Parse(resp.Body)
 }
 
-const htmlSample = `<!DOCTYPE html>
-<html>
-<head>
-<title>Status</title>
-<script src="jquery-1.7.1.min.js"></script>
-<script src="json2.js"></script>
-<script src="main_arris.js"></script>
+func main() {
+	ctx := context.Background()
+	addr := flag.String("addr", "192.168.100.1", "Modem address")
+	username := flag.String("username", "admin", "Modem username")
+	passwd := flag.String("passwd", os.Getenv("MODEM_PASSWD"), "Modem password")
+	flag.Parse()
 
-<script>
-$(document).ready(function(){
-	$("#htmlheader").load("htmlheader.htm");
-});
-</script>
-</head>
-
-<body>
-<div id="htmlheader"></div>
-	  <!-- Header Area Begin -->
-<div class="header">
-
-<script>
-$(document).ready(function(){
-	$("#pageheaderA").load("pageheaderA.htm");       
-});
-</script>
-
-         <div id="binnacleWrapper1" class="binnacleItems_hide" style="display:none;">
-            <div id="binnacleWrapper2" class="binnacleItems_hide" style="display:none;">
-                <div id="binnacleWrapperLeft"><img src="px1_Ux.png" alt="" class="binnacleWrapperShim"></div>
-                <div id="binnacleWrapperRight"><img src="px1_Ux.png" alt="" class="binnacleWrapperShim"></div>
-                <div id="binnacleWrapperMiddle">
-                    <div id="binnacleInnards">
-                            <div id="binnacleIndicatorWrap"></div>
-                    <div id="binnacleModelName"><span id="thisModelNumberIs">SB8200</span></div>
-                    </div>
-                </div>
-            <!-- end binnacleWrapper1/2 -->
-            </div>
-        </div>
-
-<div id="pageheaderA"></div>
-
-<!--gap--><div id="tmtg"><div class="gap1"><div class="gap2"><div class="gap3"><div class="gap4"></div></div></div></div></div>
-
-                <div id="tmg1"><div id="tmg2"><div id="tmg3"><div id="tmg4"><div id="tmg5"><div id="tmg6">
-
-<div id="topMenu"></div>
-
-<!-- START pageheaderB.htm ADDITIONS -->
-                <!-- end divs for tmg -->
-                </div></div></div></div></div></div>
-
-                <!--gap--><div id="tmbg"><div class="gap1"><div class="gap2"><div class="gap3"><div class="gap4"></div></div></div></div></div>
-
-                <div id="bg1"><div id="bg2"><div id="bg3"><div id="bg4">
-<!-- END pageheaderB.htm ADDITIONS -->
-
-</div> 
-	<!-- End Header -->
-
-	<div class="container">
-		<div class="subHeader">
-			<div class="subHeadcontent">Connection</div>
-		</div>
-	<div class="breadcrumbs"> 
-    	<a href="cmconnectionstatus.html">Status</a>Connection </div>
-
-	<div class="content">
-       	<div class="introText">
-    		<p>The status listed show the connection state of the cable modem. They are used by your service provider to evaluate the operation of the cable modem.</p>
-    	</div>
-
-		
-		<!--form action=/goform/cmconnectionstatus method="post" name="cmconnectionstatus"-->
-<!--% GetRgCfgValue("IpProvMode"); %-->
-<!--% GetRgCfgValue("ApplyRgConnectAction"); %-->
-	
-		
-			<center>
-			<table class="simpleTable">
-        	
-			<tr>
-            	<th colspan="3">Startup Procedure</strong></th>
-            </tr>
-
-			<tr >
-            	<td width="44%" ><strong><u>Procedure</u></strong></td>
-        		<td width="31%" ><strong><u>Status</u></strong></td>
-                <td width="25%" ><strong><u>Comment</u></strong></td>
-			</tr>
-            
-			<tr>
-            	<td>Acquire Downstream Channel</td>
-    			<td>651000000 Hz</td>
-    			<td>Locked</td>
-			</tr>
-            
-			<tr>
-            	<td>Connectivity State</td>
-    			<td>OK</td>
-    			<td>Operational</td>
-			</tr>
-          
-			<tr>
-            	<td>Boot State</td>
-			<td>OK</td>
-    			<td>Operational</td>
-			</tr>
-            
-			<!--% GetRgCfgValue("CmProcedureTable"); %-->
-                        <tr>
-            	<td >Configuration File</td>
-			<td>OK</td>			  
-    			<td><!--%ejGetOther(cmInfo, ConfigurationComment)%--></td>
-			</tr>
-			<tr>
-            	<td >Security</td>
-			<td>Enabled</td>
-    			<td>BPI+</td>
-			</tr>
-             
-			<tr>
-            	<td >DOCSIS Network Access Enabled</td>				                      
-				<td>Allowed</td>
-                                <td></td>
-			</tr>
-		</table>
-        </center>
-        
-        <br clear="all" class="clearfloat">
-		<div class="spacer30"></div>
-
-<center>
-   <table class='simpleTable'>
-<tr><th colspan=8><strong>Downstream Bonded Channels</strong></th></tr>
-      <td><strong>Channel ID</strong></td>
-      <td><strong>Lock Status</strong></td>
-      <td><strong>Modulation</strong></td>
-      <td><strong>Frequency</strong></td>
-      <td><strong>Power</strong></td>
-      <td><strong>SNR/MER</strong></td>
-      <td><strong>Corrected</strong></td>
-      <td><strong>Uncorrectables</strong></td>
-   </tr>
-   <tr align='left'>
-      <td>44</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>651000000 Hz</td>
-      <td>5.6 dBmV</td>
-      <td>40.3 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>17</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>483000000 Hz</td>
-      <td>4.8 dBmV</td>
-      <td>40.9 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>18</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>489000000 Hz</td>
-      <td>4.9 dBmV</td>
-      <td>41.0 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>19</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>495000000 Hz</td>
-      <td>5.3 dBmV</td>
-      <td>40.8 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>20</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>507000000 Hz</td>
-      <td>5.1 dBmV</td>
-      <td>40.0 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>21</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>513000000 Hz</td>
-      <td>5.1 dBmV</td>
-      <td>40.4 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>22</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>519000000 Hz</td>
-      <td>5.5 dBmV</td>
-      <td>40.5 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>23</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>525000000 Hz</td>
-      <td>6.2 dBmV</td>
-      <td>41.1 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>24</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>531000000 Hz</td>
-      <td>6.5 dBmV</td>
-      <td>41.2 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>25</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>537000000 Hz</td>
-      <td>6.4 dBmV</td>
-      <td>41.1 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>26</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>543000000 Hz</td>
-      <td>6.1 dBmV</td>
-      <td>40.7 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>27</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>549000000 Hz</td>
-      <td>5.5 dBmV</td>
-      <td>40.5 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>28</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>555000000 Hz</td>
-      <td>5.2 dBmV</td>
-      <td>40.1 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>29</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>561000000 Hz</td>
-      <td>5.6 dBmV</td>
-      <td>40.3 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>30</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>567000000 Hz</td>
-      <td>6.0 dBmV</td>
-      <td>40.9 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>31</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>573000000 Hz</td>
-      <td>6.2 dBmV</td>
-      <td>40.9 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>32</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>579000000 Hz</td>
-      <td>5.9 dBmV</td>
-      <td>40.8 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>33</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>585000000 Hz</td>
-      <td>5.4 dBmV</td>
-      <td>40.4 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>34</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>591000000 Hz</td>
-      <td>5.3 dBmV</td>
-      <td>40.2 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>35</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>597000000 Hz</td>
-      <td>5.4 dBmV</td>
-      <td>40.5 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>36</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>603000000 Hz</td>
-      <td>5.6 dBmV</td>
-      <td>40.6 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>37</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>609000000 Hz</td>
-      <td>5.6 dBmV</td>
-      <td>40.8 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>38</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>615000000 Hz</td>
-      <td>5.3 dBmV</td>
-      <td>40.5 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>39</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>621000000 Hz</td>
-      <td>5.2 dBmV</td>
-      <td>40.3 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>40</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>627000000 Hz</td>
-      <td>5.1 dBmV</td>
-      <td>40.1 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>41</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>633000000 Hz</td>
-      <td>5.4 dBmV</td>
-      <td>40.2 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>42</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>639000000 Hz</td>
-      <td>5.5 dBmV</td>
-      <td>40.5 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>43</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>645000000 Hz</td>
-      <td>5.5 dBmV</td>
-      <td>40.2 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>45</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>657000000 Hz</td>
-      <td>5.2 dBmV</td>
-      <td>40.1 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>46</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>663000000 Hz</td>
-      <td>5.2 dBmV</td>
-      <td>39.9 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>47</td>
-      <td>Locked</td>
-      <td>QAM256</td>
-      <td>669000000 Hz</td>
-      <td>5.5 dBmV</td>
-      <td>40.1 dB</td>
-      <td>0</td>
-      <td>0</td>
-   </tr>
-   <tr align='left'>
-      <td>48</td>
-      <td>Locked</td>
-      <td>Other</td>
-      <td>850000000 Hz</td>
-      <td>4.3 dBmV</td>
-      <td>37.5 dB</td>
-      <td>1012793071</td>
-      <td>0</td>
-   </tr>
-</table><br><br>
-
-</center>
-        
-<br clear="all" class="clearfloat">
-<div class="spacer30"></div>
-
-<center>
-   <table class='simpleTable'>
-<tr><th colspan=7><strong>Upstream Bonded Channels</strong></th></tr>
-      <td><strong>Channel</strong></td>
-      <td><strong>Channel ID</strong></td>
-      <td><strong>Lock Status</strong></td>
-      <td><strong>US Channel Type</td>
-      <td><strong>Frequency</strong></td>
-      <td><strong>Width</strong></td>
-      <td><strong>Power</strong></td>
-   </tr>
-   <tr align='left'>
-      <td>1</td>
-      <td>1</td>
-      <td>Locked</td>
-      <td>SC-QAM Upstream</td>
-      <td>16400000 Hz</td>
-      <td>6400000 Hz</td>
-      <td>40.0 dBmV</td>
-   </tr>
-   <tr align='left'>
-      <td>2</td>
-      <td>2</td>
-      <td>Locked</td>
-      <td>SC-QAM Upstream</td>
-      <td>22800000 Hz</td>
-      <td>6400000 Hz</td>
-      <td>41.0 dBmV</td>
-   </tr>
-   <tr align='left'>
-      <td>3</td>
-      <td>3</td>
-      <td>Locked</td>
-      <td>SC-QAM Upstream</td>
-      <td>29200000 Hz</td>
-      <td>6400000 Hz</td>
-      <td>41.0 dBmV</td>
-   </tr>
-   <tr align='left'>
-      <td>4</td>
-      <td>4</td>
-      <td>Locked</td>
-      <td>SC-QAM Upstream</td>
-      <td>35600000 Hz</td>
-      <td>6400000 Hz</td>
-      <td>41.0 dBmV</td>
-   </tr>
-   <tr align='left'>
-      <td>5</td>
-      <td>5</td>
-      <td>Locked</td>
-      <td>SC-QAM Upstream</td>
-      <td>40400000 Hz</td>
-      <td>3200000 Hz</td>
-      <td>43.0 dBmV</td>
-   </tr>
-</table><br><br>
-
-</center>
-
-<br clear="all" class="clearfloat">
-<div class="spacer30"></div>
-
-<p id="systime" align="center"><strong>Current System Time:</strong> Sun Feb  6 22:57:58 2022
-</p>
-
-</div>
-
-
-<!--/form-->
-
-
-<br clear="all" class="clearfloat">
-<div class="spacer40"></div>
-
-<!-- end .container --></div> 
-
-<!-- Footer and Sitemap -->
-<!-- end divs for bc -->
-</div></div></div></div>	
-<!--gap--><div id="bmtg"><div class="gap1"><div class="gap2"><div class="gap3"><div class="gap4"></div></div></div></div></div>
-   
-<center><div id="siteMapBottom"></div></center>
-<script>
-$(document).ready(function(){
-        $("#footer").load("footer.htm");
-});
-</script>
-<div id="footer"></div>
-
-</body>
-</html>
-`
-
-//Request URL: https://192.168.100.1/cmconnectionstatus.html?login_YWRtaW46JE5lVDZhcEhBNA==
-//Authorization: Basic
-//Cookie: HttpOnly: true, Secure: true
-//contentType: 'application/x-www-form-urlencoded; charset=utf-8',
-
-//response Set-Cookie: sessionId=CiuoEU1O5rcihrcPfWE1ecftiDV5xph; HttpOnly; Secure
-
-//Request URL: https://192.168.100.1/cmconnectionstatus.html?ct_LRtwlpgCSr6hRo9hsfUTUoS5SpAA3R0
-//Cookie: HttpOnly: true, Secure: true; sessionId=CiuoEU1O5rcihrcPfWE1ecftiDV5xph
+	page, err := fetchPage(ctx, *addr, *username, *passwd)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if findTextNode(page, "Login") != nil {
+		log.Fatal("Unable to get past login page")
+	}
+	downstream, err := parseDownstream(page)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(downstream)
+	fmt.Println(parseUpstream(page))
+}
