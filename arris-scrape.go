@@ -19,8 +19,13 @@ import (
 	"golang.org/x/net/html"
 )
 
+const (
+	downPrefix = "downstream_bonded_channels"
+	upPrefix   = "upstream_bonded_channels"
+)
+
 type downstreamChannel struct {
-	ChannelID      int
+	ChannelID      string
 	LockStatus     string
 	Modulation     string
 	FrequencyHz    int64
@@ -32,7 +37,7 @@ type downstreamChannel struct {
 
 type upstreamChannel struct {
 	Channel     string
-	ChannelID   int
+	ChannelID   string
 	LockStatus  string
 	ChannelType string
 	FrequencyHz int64
@@ -81,10 +86,6 @@ func parseDownstream(page *html.Node) ([]downstreamChannel, error) {
 		return nil, fmt.Errorf("unable to find downstream bonded channels table")
 	}
 	for _, row := range scrapeTable(tableTitle.Parent.Parent.Parent) {
-		channelID, err := strconv.Atoi(row[0])
-		if err != nil {
-			return nil, err
-		}
 		frequencyHz, err := strconv.ParseInt(strings.Split(row[3], " ")[0], 10, 64)
 		if err != nil {
 			return nil, err
@@ -106,7 +107,7 @@ func parseDownstream(page *html.Node) ([]downstreamChannel, error) {
 			return nil, err
 		}
 		data = append(data, downstreamChannel{
-			ChannelID:      channelID,
+			ChannelID:      row[0],
 			LockStatus:     row[1],
 			Modulation:     row[2],
 			FrequencyHz:    frequencyHz,
@@ -125,10 +126,6 @@ func parseUpstream(page *html.Node) ([]upstreamChannel, error) {
 		return nil, fmt.Errorf("unable to find upstream bonded channels table")
 	}
 	for _, row := range scrapeTable(tableTitle.Parent.Parent.Parent) {
-		channelID, err := strconv.Atoi(row[1])
-		if err != nil {
-			return nil, err
-		}
 		frequencyHz, err := strconv.ParseInt(strings.Split(row[4], " ")[0], 10, 64)
 		if err != nil {
 			return nil, err
@@ -143,7 +140,7 @@ func parseUpstream(page *html.Node) ([]upstreamChannel, error) {
 		}
 		data = append(data, upstreamChannel{
 			Channel:     row[0],
-			ChannelID:   channelID,
+			ChannelID:   row[1],
 			LockStatus:  row[2],
 			ChannelType: row[3],
 			FrequencyHz: frequencyHz,
@@ -175,6 +172,16 @@ func fetchPage(ctx context.Context, addr, username, passwd string) (*html.Node, 
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 		},
 	}
+	// Start off with a login page request. An auth request will only
+	// succeed after a login page has been presented.
+	loginPageReq, err := http.NewRequestWithContext(ctx, "GET", "https://"+addr, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = client.Do(loginPageReq); err != nil {
+		return nil, err
+	}
+	// After the login page, poke at auth directly
 	authReq, err := http.NewRequestWithContext(ctx, "GET", authURL, nil)
 	if err != nil {
 		return nil, err
@@ -218,6 +225,24 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(downstream)
-	fmt.Println(parseUpstream(page))
+	for _, d := range downstream {
+		fmt.Printf(downPrefix+"_lock_status{channel_id=%q} %v\n", d.ChannelID, d.LockStatus)
+		fmt.Printf(downPrefix+"_modulation{channel_id=%q} %v\n", d.ChannelID, d.Modulation)
+		fmt.Printf(downPrefix+"_frequency_hz{channel_id=%q} %v\n", d.ChannelID, d.FrequencyHz)
+		fmt.Printf(downPrefix+"_power_dbmv{channel_id=%q} %v\n", d.ChannelID, d.PowerdBmV)
+		fmt.Printf(downPrefix+"_snr_mer_db{channel_id=%q} %v\n", d.ChannelID, d.SNRMERdB)
+		fmt.Printf(downPrefix+"_corrected{channel_id=%q} %v\n", d.ChannelID, d.Corrected)
+		fmt.Printf(downPrefix+"_uncorrectables{channel_id=%q} %v\n", d.ChannelID, d.Uncorrectables)
+	}
+	upstream, err := parseUpstream(page)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, u := range upstream {
+		fmt.Printf(upPrefix+"_lock_status{channel_id=%q} %v\n", u.ChannelID, u.LockStatus)
+		fmt.Printf(upPrefix+"_channel_type{channel_id=%q} %v\n", u.ChannelID, u.ChannelType)
+		fmt.Printf(upPrefix+"_frequency_hz{channel_id=%q} %v\n", u.ChannelID, u.FrequencyHz)
+		fmt.Printf(upPrefix+"_width_hz{channel_id=%q} %v\n", u.ChannelID, u.WidthHz)
+		fmt.Printf(upPrefix+"_power_dbmv{channel_id=%q} %v\n", u.ChannelID, u.PowerdBmV)
+	}
 }
