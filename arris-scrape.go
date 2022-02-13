@@ -19,11 +19,6 @@ import (
 	"golang.org/x/net/html"
 )
 
-const (
-	downPrefix = "downstream_bonded_channels"
-	upPrefix   = "upstream_bonded_channels"
-)
-
 type downstreamChannel struct {
 	ChannelID      string
 	LockStatus     string
@@ -226,23 +221,21 @@ func main() {
 		log.Fatal(err)
 	}
 	for _, d := range downstream {
-		fmt.Printf(downPrefix+"_lock_status{channel_id=%q} %v\n", d.ChannelID, d.LockStatus)
-		fmt.Printf(downPrefix+"_modulation{channel_id=%q} %v\n", d.ChannelID, d.Modulation)
-		fmt.Printf(downPrefix+"_frequency_hz{channel_id=%q} %v\n", d.ChannelID, d.FrequencyHz)
-		fmt.Printf(downPrefix+"_power_dbmv{channel_id=%q} %v\n", d.ChannelID, d.PowerdBmV)
-		fmt.Printf(downPrefix+"_snr_mer_db{channel_id=%q} %v\n", d.ChannelID, d.SNRMERdB)
-		fmt.Printf(downPrefix+"_corrected{channel_id=%q} %v\n", d.ChannelID, d.Corrected)
-		fmt.Printf(downPrefix+"_uncorrectables{channel_id=%q} %v\n", d.ChannelID, d.Uncorrectables)
+		// Print everything in Promethius format, float64 only
+		fmt.Printf("downstream_bonded_channels_frequency_hz{channel_id=%q} %v\n", d.ChannelID, d.FrequencyHz)
+		fmt.Printf("downstream_bonded_channels_power_dbmv{channel_id=%q} %v\n", d.ChannelID, d.PowerdBmV)
+		fmt.Printf("downstream_bonded_channels_snr_mer_db{channel_id=%q} %v\n", d.ChannelID, d.SNRMERdB)
+		fmt.Printf("downstream_bonded_channels_corrected{channel_id=%q} %v\n", d.ChannelID, d.Corrected)
+		fmt.Printf("downstream_bonded_channels_uncorrectables{channel_id=%q} %v\n", d.ChannelID, d.Uncorrectables)
 	}
 	upstream, err := parseUpstream(page)
 	if err != nil {
 		log.Fatal(err)
 	}
 	for _, u := range upstream {
-		fmt.Printf(upPrefix+"_lock_status{channel_id=%q} %v\n", u.ChannelID, u.LockStatus)
-		fmt.Printf(upPrefix+"_channel_type{channel_id=%q} %v\n", u.ChannelID, u.ChannelType)
-		fmt.Printf(upPrefix+"_frequency_hz{channel_id=%q} %v\n", u.ChannelID, u.FrequencyHz)
-		fmt.Printf(upPrefix+"_width_hz{channel_id=%q} %v\n", u.ChannelID, u.WidthHz)
-		fmt.Printf(upPrefix+"_power_dbmv{channel_id=%q} %v\n", u.ChannelID, u.PowerdBmV)
+		// Print everything in Promethius format, float64 only
+		fmt.Printf("upstream_bonded_channels_frequency_hz{channel_id=%q} %v\n", u.ChannelID, u.FrequencyHz)
+		fmt.Printf("upstream_bonded_channels_width_hz{channel_id=%q} %v\n", u.ChannelID, u.WidthHz)
+		fmt.Printf("upstream_bonded_channels_power_dbmv{channel_id=%q} %v\n", u.ChannelID, u.PowerdBmV)
 	}
 }
