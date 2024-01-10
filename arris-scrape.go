@@ -4,17 +4,18 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 
 	"golang.org/x/net/html"
 )
@@ -146,34 +147,29 @@ func parseUpstream(page *html.Node) ([]upstreamChannel, error) {
 	return data, nil
 }
 
-func fetchPage(ctx context.Context, addr, username, passwd string) (*html.Node, error) {
-	baseURL := "https://" + addr + "/cmconnectionstatus.html"
-	authURL := baseURL + "?login_" + base64.URLEncoding.EncodeToString([]byte(username+":"+passwd))
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, err
+func (f *fetcher) fetchPage(ctx context.Context) (*html.Node, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.token != "" {
+		// Try logging in with the token we already have
+		page, err := f.fetchPageInner(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if findTextNode(page, "Login") == nil {
+			return page, nil
+		}
 	}
-	client := &http.Client{
-		Jar: jar,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+
 	// Start off with a login page request. An auth request will only
 	// succeed after a login page has been presented.
-	loginPageReq, err := http.NewRequestWithContext(ctx, "GET", "https://"+addr, nil)
+	authURL := "https://" + f.addr + "/cmconnectionstatus.html?login_" + base64.URLEncoding.EncodeToString([]byte(f.username+":"+f.passwd))
+	loginPageReq, err := http.NewRequestWithContext(ctx, "GET", "https://"+f.addr, nil)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = client.Do(loginPageReq); err != nil {
+	if _, err = f.client.Do(loginPageReq); err != nil {
 		return nil, err
 	}
 	// After the login page, poke at auth directly
@@ -181,61 +177,110 @@ func fetchPage(ctx context.Context, addr, username, passwd string) (*html.Node, 
 	if err != nil {
 		return nil, err
 	}
-	authReq.SetBasicAuth(username, passwd)
-	authResp, err := client.Do(authReq)
+	authReq.SetBasicAuth(f.username, f.passwd)
+	authResp, err := f.client.Do(authReq)
 	if err != nil {
 		return nil, err
 	}
+	log.Print("authenticated to modem")
 	token, err := ioutil.ReadAll(authResp.Body)
 	if err != nil {
 		return nil, err
 	}
-	url := baseURL + "?ct_" + string(token)
+	f.token = string(token)
+	return f.fetchPageInner(ctx)
+}
+
+func (f *fetcher) fetchPageInner(ctx context.Context) (*html.Node, error) {
+	url := "https://" + f.addr + "/cmconnectionstatus.html?ct_" + f.token
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := client.Do(req)
+	resp, err := f.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	return html.Parse(resp.Body)
 }
 
-func main() {
-	ctx := context.Background()
-	addr := flag.String("addr", "192.168.100.1", "Modem address")
-	username := flag.String("username", "admin", "Modem username")
-	passwd := flag.String("passwd", os.Getenv("MODEM_PASSWD"), "Modem password")
-	flag.Parse()
+type fetcher struct {
+	addr, username, passwd string
+	client                 *http.Client
+	mu                     sync.Mutex
+	token                  string
+}
 
-	page, err := fetchPage(ctx, *addr, *username, *passwd)
+func newFetcher(addr, username, passwd string) (*fetcher, error) {
+	jar, err := cookiejar.New(nil)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
+	}
+	client := &http.Client{
+		Jar: jar,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	return &fetcher{addr: addr, username: username, passwd: passwd, client: client}, nil
+}
+
+func (f *fetcher) writeMetrics(ctx context.Context, w io.Writer) error {
+	page, err := f.fetchPage(ctx)
+	if err != nil {
+		return err
 	}
 	if findTextNode(page, "Login") != nil {
-		log.Fatal("Unable to get past login page")
+		return errors.New("Unable to get past login page")
 	}
 	downstream, err := parseDownstream(page)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	for _, d := range downstream {
-		// Print everything in Promethius format, float64 only
-		fmt.Printf("downstream_bonded_channels_frequency_hz{channel_id=%q} %v\n", d.ChannelID, d.FrequencyHz)
-		fmt.Printf("downstream_bonded_channels_power_dbmv{channel_id=%q} %v\n", d.ChannelID, d.PowerdBmV)
-		fmt.Printf("downstream_bonded_channels_snr_mer_db{channel_id=%q} %v\n", d.ChannelID, d.SNRMERdB)
-		fmt.Printf("downstream_bonded_channels_corrected{channel_id=%q} %v\n", d.ChannelID, d.Corrected)
-		fmt.Printf("downstream_bonded_channels_uncorrectables{channel_id=%q} %v\n", d.ChannelID, d.Uncorrectables)
+		// Print everything in Prometheus format, float64 only
+		fmt.Fprintf(w, "downstream_bonded_channels_frequency_hz{channel_id=%q} %v\n", d.ChannelID, d.FrequencyHz)
+		fmt.Fprintf(w, "downstream_bonded_channels_power_dbmv{channel_id=%q} %v\n", d.ChannelID, d.PowerdBmV)
+		fmt.Fprintf(w, "downstream_bonded_channels_snr_mer_db{channel_id=%q} %v\n", d.ChannelID, d.SNRMERdB)
+		fmt.Fprintf(w, "downstream_bonded_channels_corrected{channel_id=%q} %v\n", d.ChannelID, d.Corrected)
+		fmt.Fprintf(w, "downstream_bonded_channels_uncorrectables{channel_id=%q} %v\n", d.ChannelID, d.Uncorrectables)
 	}
 	upstream, err := parseUpstream(page)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	for _, u := range upstream {
-		// Print everything in Promethius format, float64 only
-		fmt.Printf("upstream_bonded_channels_frequency_hz{channel_id=%q} %v\n", u.ChannelID, u.FrequencyHz)
-		fmt.Printf("upstream_bonded_channels_width_hz{channel_id=%q} %v\n", u.ChannelID, u.WidthHz)
-		fmt.Printf("upstream_bonded_channels_power_dbmv{channel_id=%q} %v\n", u.ChannelID, u.PowerdBmV)
+		// Print everything in Prometheus format, float64 only
+		fmt.Fprintf(w, "upstream_bonded_channels_frequency_hz{channel_id=%q} %v\n", u.ChannelID, u.FrequencyHz)
+		fmt.Fprintf(w, "upstream_bonded_channels_width_hz{channel_id=%q} %v\n", u.ChannelID, u.WidthHz)
+		fmt.Fprintf(w, "upstream_bonded_channels_power_dbmv{channel_id=%q} %v\n", u.ChannelID, u.PowerdBmV)
+	}
+	return nil
+}
+
+func main() {
+	ctx := context.Background()
+	addr := flag.String("modem-addr", "192.168.100.1", "Modem address")
+	username := flag.String("username", "admin", "Modem username")
+	passwd := flag.String("passwd", os.Getenv("MODEM_PASSWD"), "Modem password")
+	httpAddr := flag.String("http-addr", "", "Address like 0.0.0.0:1234. If provided, will run in server mode")
+	flag.Parse()
+
+	fetcher, err := newFetcher(*addr, *username, *passwd)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *httpAddr != "" {
+		log.Printf("serving on %v", *httpAddr)
+		http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			if err := fetcher.writeMetrics(r.Context(), w); err != nil {
+				log.Print(err)
+			}
+			log.Print("successfully fetched metrics")
+		})
+		log.Fatal(http.ListenAndServe(*httpAddr, nil))
+	}
+	if err := fetcher.writeMetrics(ctx, os.Stdout); err != nil {
+		log.Fatal(err)
 	}
 }

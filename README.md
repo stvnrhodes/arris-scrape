@@ -1,5 +1,5 @@
 arris-scrape will read from Arris's modem web page and output Prometheus-style
-metrics as a one-shot.
+metrics as a one-shot or as a server.
 
 Tested only on an Arris SURFboard SB8200.
 
@@ -38,3 +38,5 @@ It's intended to be run repeatedly by another tool. For example, for Telegraf:
   interval = "60s"
   timeout = "30s"
 ```
+
+Pass in a flag like `-http-addr=:5000` to run in server mode.
