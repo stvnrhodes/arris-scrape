@@ -1,3 +1,5 @@
+# arris-scrape
+
 arris-scrape will read from Arris's modem web page and output Prometheus-style
 metrics as a one-shot or as a server.
 
@@ -28,15 +30,4 @@ Upstream metrics:
 
 ![upstream example](upstream.png)
 
-It's intended to be run repeatedly by another tool. For example, for Telegraf:
-
-```
-[[inputs.exec]]
-  name_override = "modem"
-  commands = ["arris-scrape -passwd 'my password'"]
-  data_format = "prometheus"
-  interval = "60s"
-  timeout = "30s"
-```
-
-Pass in a flag like `-http-addr=:5000` to run in server mode.
+It runs as a one-off sending metrics to stdout by default. Pass in a flag like `-http-addr=:5000` to run in server mode.

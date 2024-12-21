@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
@@ -183,7 +182,7 @@ func (f *fetcher) fetchPage(ctx context.Context) (*html.Node, error) {
 		return nil, err
 	}
 	log.Print("authenticated to modem")
-	token, err := ioutil.ReadAll(authResp.Body)
+	token, err := io.ReadAll(authResp.Body)
 	if err != nil {
 		return nil, err
 	}
