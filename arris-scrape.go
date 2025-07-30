@@ -218,7 +218,41 @@ func newFetcher(addr, username, passwd string) (*fetcher, error) {
 	client := &http.Client{
 		Jar: jar,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				// Manually specify cipher suites because the modem uses outdated ones that are not
+				// included in the default cipher suites in Go 1.22 and later.
+				// https://github.com/golang/go/issues/66512
+				CipherSuites: []uint16{
+					// TLS 1.0 - 1.2 cipher suites.
+					tls.TLS_RSA_WITH_RC4_128_SHA,
+					tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+					tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+					tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+					tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+					tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+					tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
+					tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+					// TLS 1.3 cipher suites.
+					tls.TLS_AES_128_GCM_SHA256,
+					tls.TLS_AES_256_GCM_SHA384,
+					tls.TLS_CHACHA20_POLY1305_SHA256,
+				},
+			},
 		},
 	}
 	return &fetcher{addr: addr, username: username, passwd: passwd, client: client}, nil
@@ -269,6 +303,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := fetcher.writeMetrics(ctx, os.Stdout); err != nil {
+		log.Fatal(err)
+	}
 	if *httpAddr != "" {
 		log.Printf("serving on %v", *httpAddr)
 		http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -278,8 +315,5 @@ func main() {
 			log.Print("successfully fetched metrics")
 		})
 		log.Fatal(http.ListenAndServe(*httpAddr, nil))
-	}
-	if err := fetcher.writeMetrics(ctx, os.Stdout); err != nil {
-		log.Fatal(err)
 	}
 }
